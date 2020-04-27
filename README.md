@@ -46,20 +46,27 @@ All local files that are listed in the `config.json` file are synced into a sing
 
 ### Auto-generate gist filenames
 
-The file names in gist are automatically created. This script is opinionated on the file names being created. The characters "/" and "~" are replaced with periods (.). Duplicate consecutive periods are also removed.
+The file names in gist are automatically created. This script is opinionated on the file names being created. The characters "/" and "~" are replaced with periods (.). Duplicate consecutive periods in the name are also removed.
 
 ### Prompts before syncing each file
 
-Every file listed in the `config.json`, whether being pushed to or pulled from gist, is synced only after a confirmation prompt. A sync is performed __only__ you enter a "y" or a "yes" (case-insensitive). Any other input is ignored from sync.
+Every file listed in the `config.json`, whether being pushed to or pulled from gist, is synced only after a confirmation prompt. A sync is performed __only__ after you enter a "y" or a "yes" (case-insensitive). Any other input is ignored from sync.
 
 ### Creates a backup of the local file contents before overriding
 
 During a fetch operation (syncing local files from gist), a sync is performed, only after creating a backup of the local file. The backup file name is auto-generated based on the current timestamp.
 
+Prerequisites
+-------------
+
+This script uses [jq](https://stedolan.github.io/jq/download/) to parse the `config.json` on the local filesystem. You can run the following command on OS X, if you have [Homebrew](https://brew.sh/) installed:
+
+       brew install jq
+
 Installation
 ------------
 
-Installing dotfilesync is easy and a one-time effort:
+Ensure the [prerequisite](#prerequisites) tools are setup. Installing dotfilesync is easy and a one-time effort:
 
 1. Start a Zsh shell:
 
@@ -79,25 +86,15 @@ Installing dotfilesync is easy and a one-time effort:
         && wget -nv -O - https://raw.githubusercontent.com/snvishna/dotfilesync/master/src/dfsync_osx.sh \
           >| ${HOME}/.dotfilesync/dfsync.sh
 
-3. Fetch config.json template locally:
+3. Add an entry in zshrc:
 
-  * With curl:
+    You'll find the zshrc file in your $HOME directory. Open it with your favorite text editor and add the following alias in there:
 
-        curl -fsSL https://raw.githubusercontent.com/snvishna/dotfilesync/master/config_template.json \
-          >| ${HOME}/.dotfilesync/config.json
-
-  * With wget:
-
-        wget -nv -O - https://raw.githubusercontent.com/snvishna/dotfilesync/master/config_template.json \
-          >| ${HOME}/.dotfilesync/config.json
-
-4. Create a new gist:
-
-    You can follow [these instructions](https://help.github.com/en/github/writing-on-github/creating-gists) on how to create a new secret gist online.
+        alias dfsync='bash ${HOME}/.dotfilesync/dfsync.sh'
     
-    ![](./resources/create_secret_gist.gif)
+    You can now use the `dfsync` command after you restart the terminal, or source your zsh config.
 
-5. Create Person Access Token on GitHub:
+4. Create Person Access Token on GitHub:
 
     You can create a new [person access tokens page](https://github.com/settings/tokens/new) for running the script on the command line. Follow [these instructions](https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line) on how to create one. Make sure you have the __gist__ scope selected to grant permission on this token.
 
@@ -105,31 +102,39 @@ Installing dotfilesync is easy and a one-time effort:
     
     ![](./resources/generate_personal_access_token.gif)
 
-6. Update the config:
+5. Run setup:
 
-    Once you have a list of local files that you'd like to sync with your private gist, you'll need to list them in the `config.json` file.
+    Run the command `dfsync setup` from your terminal. It prompts for your GitHub username and the personal access token. Refer to the [Commands](#commands) section for more details on this command.
 
-        vi ${HOME}/.dotfilesync/config.json
-  
-    Enter your GitHub username, the Personal Access Token created above, and a list of local file paths that you would like to sync. You can refer to the sample config shape in the _Features_ section of this doc for more information on how to list this metadata.
+    ![](./resources/dfsync-setup.gif)
 
-7. Add an entry in zshrc:
-
-    You'll find the zshrc file in your $HOME directory. Open it with your favorite text editor and add the following alias in there:
-
-        alias dfsync='bash ${HOME}/.dotfilesync/dfsync.sh'
-
-
-8. You're done! Enjoy dotfilesync!
+6. You're done! Enjoy dotfilesync!
 
 Usage
 -----
 
-You can run the following commands:
+* Update the `config.json` file with a list of local file paths that you'd like to sync with gist. You can now run `dfsync push` to upload these files in the gist.
 
-* __dfsync password save__
+    ![](./resources/dfsync-push.gif)
 
-  This command is used only once to save your person access token in your OS X Keychain. You won't have to do this again, once added. The username associated with this access token is defined in the `config.json` file.
+Commands
+--------
+
+* __dfsync setup__
+
+  It is run only __once__ as part of the installation instructions. This command does the following:
+
+  * Prompts for your GitHub username and the personal access token. It then stores this information securely in the OS X Keychain.
+
+  * Creates a new secret gist in your account with the description - "Generated by dotfilesync utility".
+
+  * It then creates a new `config.json` file, and auto-populates your Github username and the gistId fields.
+
+  * Saves this file in the `${HOME}/.dotfilesync` directory.
+
+  * It also syncs this config file to this gist.
+
+  > It is a good practice to leave the `config.json` file to sync with your gist, so you can recover or download these files with the `dfsync pull` command when you need them.
 
 * __dfsync push__
 
@@ -143,6 +148,32 @@ You can run the following commands:
 
   This command will work only after the `dfsync password save` is run once, so the personal access token is saved.
 
-* __dfsync password delete__
+* __dfsync cleanup__
 
-  This command will delete your personal access token from the OS X keychain that is associated with the username defined in the `config.json` file.
+  This command will do the following:
+
+  * Delete the saved GitHub gist credentials from the OS X Keychain.
+  * Delete `config.json` file from the `${HOME}/.dotfilesync` directory.
+  * It does not automatically delete the saved gist from your GitHub account. Rather, it prints out the HTTP link to your gist, so you can choose to delete it.
+  * It provides a link to the uninstall instructions in this README, so you can run the commands to delete the script and update the zsh config.
+
+Uninstall
+---------
+
+You can cleanup the script and all resources created by it, using the following instructions:
+
+* __Run__ `dfsync cleanup`
+
+  You can run the command to 1) Delete the saved GitHub gist credentials from the OS X Keychain 2) Delete `config.json` file from the `${HOME}/.dotfilesync` directory.
+
+* __Delete the gist__
+
+  To be safe, the clean up command __does not automatically__ delete your gist from your account. You can choose to do this manually. The URL to your gist will be printed on the terminal when you run `dfsync cleanup`.
+
+* __Delete the local file__
+
+  You can now delete the dotfilesync directory from your machine. Run the following command: `rm -rf ${HOME}/.dotfilesync`
+
+* __Remove alias from zsh config__
+
+  You should now remove the `dfsync` alias from the zsh config. Otherwise this command will fail on the missing file path.
