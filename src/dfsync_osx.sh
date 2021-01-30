@@ -121,9 +121,9 @@ push() {
     read -r -p "Pushing $row to $fileName?" put_confirm_response
     if [[ "$put_confirm_response" =~ ^([yY][eE][sS]|[yY])$ ]];
     then
-    # Workaround for "No such file or directory" error when using ~ in the path: https://stackoverflow.com/a/3963747/640607
-    local absolutePath=$(echo $row | sed -e "s:~/:$homedir/:g")
-    cat $absolutePath | updateGistFile $github_user $github_password $dotfiles_gistid $fileName
+      # Workaround for "No such file or directory" error when using ~ in the path: https://stackoverflow.com/a/3963747/640607
+      local absolutePath=$(echo $row | sed -e "s:~/:$homedir/:g")
+      cat $absolutePath | updateGistFile $github_user $github_password $dotfiles_gistid $fileName
     fi
   done
 }
