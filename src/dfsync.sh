@@ -8,21 +8,44 @@ HOME_DIR=~
 DOTFILESYNC_ROOT_PATH="~/.dotfilesync"
 DOTFILESYNC_CONFIG_PATH="$DOTFILESYNC_ROOT_PATH/config.json"
 eval DOTFILESYNC_CONFIG=$DOTFILESYNC_CONFIG_PATH
+UNAME="$( command -v uname )"
+OSTYPE="$( "${UNAME}" | tr '[:upper:]' '[:lower:]')"
 
 backup() {
   cp -n $1{,.bak."$(date +%Y%m%d-%H%M%S)"}
 }
 
 addKeychainPassword() {
-  security add-generic-password -a $1 -s $3 -w $2
+  case $OSTYPE in
+    darwin*)
+      security add-generic-password -a $1 -s $3 -w $2
+      ;;
+    linux*)
+      echo $2 | secret-tool store --label $3 user $1 usage $3
+      ;;
+  esac
 }
 
 getKeychainPassword() {
-  security find-generic-password -wga $1 -s $2
+  case $OSTYPE in
+    darwin*)
+      security find-generic-password -wga $1 -s $2
+      ;;
+    linux*)
+      secret-tool lookup user $1 usage $2
+      ;;
+  esac
 }
 
 deleteKeychainPassword() {
-  security delete-generic-password -a $1 -s $2
+  case $OSTYPE in
+    darwin*)
+      security delete-generic-password -a $1 -s $2
+      ;;
+    linux*)
+      secret-tool clear user $1 usage $2
+      ;;
+  esac
 }
 
 getGistFileName() {
@@ -121,9 +144,9 @@ push() {
     read -r -p "Pushing $row to $fileName?" put_confirm_response
     if [[ "$put_confirm_response" =~ ^([yY][eE][sS]|[yY])$ ]];
     then
-    # Workaround for "No such file or directory" error when using ~ in the path: https://stackoverflow.com/a/3963747/640607
-    local absolutePath=$(echo $row | sed -e "s:~/:$homedir/:g")
-    cat $absolutePath | updateGistFile $github_user $github_password $dotfiles_gistid $fileName
+      # Workaround for "No such file or directory" error when using ~ in the path: https://stackoverflow.com/a/3963747/640607
+      local absolutePath=$(echo $row | sed -e "s:~/:$homedir/:g")
+      cat $absolutePath | updateGistFile $github_user $github_password $dotfiles_gistid $fileName
     fi
   done
 }
