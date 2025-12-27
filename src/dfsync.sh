@@ -68,7 +68,7 @@ createPrivateGistWithConfigJson() {
 
 updateGistFile() {
   jq -R -s 'split("") | join("") | {files: {"'"$4"'": {content: .}}}' | \
-    curl -s -u $1:$2 -XPATCH "https://api.github.com/gists/$3" -d @- | \
+    sleep 2; curl -s -u $1:$2 -XPATCH "https://api.github.com/gists/$3" -d @- | \
     jq -r -e  'if .description then "updated: " + .description else . end'
 }
 
