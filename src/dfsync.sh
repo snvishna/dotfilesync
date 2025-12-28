@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# Dotfilesync v5.0.0: Enterprise Grade
+# Dotfilesync v5.0.1: Enterprise Grade
 # ==============================================================================
 # Design Principles:
 # 1. Location Agnostic: Script handles symlinks and arbitrary install paths.
@@ -15,7 +15,7 @@ set -o nounset  # Abort on unbound variable
 set -o pipefail # Capture pipeline errors
 
 # --- CONSTANTS ---
-readonly VERSION="5.0.0"
+readonly VERSION="5.0.1"
 readonly GITHUB_API="https://api.github.com"
 readonly TMP_DIR=$(mktemp -d -t dfsync.XXXXXX)
 
@@ -166,7 +166,9 @@ cmd_config() {
             local current=$(get_config_path)
             if [[ -n "$current" ]]; then
                 log_info "Active Config: $current"
-                cat "$current" | jq 'del(.dotFilePaths)' # Show metadata only
+                log_info "Content:"
+                # UPDATED: Show full content including paths
+                cat "$current" | jq .
             else
                 log_warn "No active config found. (Search path: ENV -> POINTER -> LOCAL -> XDG)"
             fi
