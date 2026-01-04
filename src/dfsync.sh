@@ -215,12 +215,21 @@ cmd_track() {
     local config_file
     config_file=$(get_config_path)
     ensure_valid_config "$config_file"
+    
     local clean_path="${file/$HOME/\~}"
     local tmp
     tmp=$(mktemp)
     
+    debug "Tracking file: $clean_path"
+
     set +e
-    jq --arg f "$clean_path" 'if .dotFilePaths then .dotFilePaths += [$f] | .dotFilePaths |= unique else (.files // []) + [$f] | .files |= unique end' "$config_file" > "$tmp"
+    # 1. If root is an array, wrap it in {files: []}
+    # 2. If .files is null, initialize it
+    # 3. Add the new file and keep unique
+    jq --arg f "$clean_path" '
+        (if type == "array" then {files: ., gist_id: ""} else . end)
+        | .files |= (if . == null then [] else . end | . + [$f] | unique)
+    ' "$config_file" > "$tmp"
     local status=$?
     set -e
 
@@ -229,7 +238,7 @@ cmd_track() {
         success "Now tracking: $clean_path"
     else
         rm -f "$tmp"
-        error "Failed to update config."
+        error "Failed to update config. Check if JSON is valid."
     fi
 }
 
@@ -240,12 +249,16 @@ cmd_untrack() {
     local config_file
     config_file=$(get_config_path)
     ensure_valid_config "$config_file"
+    
     local clean_path="${file/$HOME/\~}"
     local tmp
     tmp=$(mktemp)
     
     set +e
-    jq --arg f "$clean_path" 'if .dotFilePaths then .dotFilePaths |= map(select(. != $f)) else (.files // []) |= map(select(. != $f)) end' "$config_file" > "$tmp"
+    jq --arg f "$clean_path" '
+        (if type == "array" then {files: ., gist_id: ""} else . end)
+        | .files |= (if . == null then [] else map(select(. != $f)) end)
+    ' "$config_file" > "$tmp"
     local status=$?
     set -e
 
