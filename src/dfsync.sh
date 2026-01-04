@@ -1,274 +1,480 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# dfsync - Dotfile Sync to Gist
+# v3.3 - Debug Crash Fix & Flexible Argument Parsing
 
-# ==============================================================================
-# Dotfilesync v5.0.1: Enterprise Grade
-# ==============================================================================
-# Design Principles:
-# 1. Location Agnostic: Script handles symlinks and arbitrary install paths.
-# 2. Config Resolution: ENV -> Pointer File -> Local Fallback.
-# 3. Idempotency: Operations are safe to repeat.
-# 4. Observability: Structured logging to stdout/stderr.
-# ==============================================================================
+set -e
 
-set -o errexit  # Exit on error
-set -o nounset  # Abort on unbound variable
-set -o pipefail # Capture pipeline errors
+# --- Constants ---
+KEYCHAIN_SERVICE="dotfilesync"
+KEYCHAIN_ACCOUNT="github_token"
+CONFIG_POINTER="${HOME}/.dfsyncrc"
+DEFAULT_CONFIG_PATH="${HOME}/.config/dfsync.json"
+LINUX_TOKEN_FILE="${HOME}/.dfsync_token"
 
-# --- CONSTANTS ---
-readonly VERSION="5.0.1"
-readonly GITHUB_API="https://api.github.com"
-readonly TMP_DIR=$(mktemp -d -t dfsync.XXXXXX)
+# --- Globals ---
+YES_MODE=false
+VERBOSE_MODE=false
+OS_TYPE="$(uname -s)"
 
-# XDG Standard for state/config
-readonly XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-readonly STATE_DIR="${XDG_CONFIG_HOME}/dfsync"
-readonly POINTER_FILE="${STATE_DIR}/active_config_path"
+# --- Crash Trap ---
+trap '[[ $? -ne 0 ]] && echo -e "\n\033[0;31m[CRASH] Script aborted on line $LINENO.\033[0m"' EXIT
 
-# Colors
-readonly R='\033[0;31m'
-readonly G='\033[0;32m'
-readonly Y='\033[1;33m'
-readonly B='\033[0;34m'
-readonly C='\033[0;36m'
-readonly NC='\033[0m'
+# --- Helpers ---
+log() { echo -e "\033[0;34m[dfsync]\033[0m $1"; }
+success() { echo -e "\033[0;32m[OK]\033[0m $1"; }
+error() { echo -e "\033[0;31m[ERROR]\033[0m $1"; exit 1; }
+warn() { echo -e "\033[0;33m[WARN]\033[0m $1"; }
 
-# --- CLEANUP TRAP ---
-cleanup() { rm -rf "$TMP_DIR"; }
-trap cleanup EXIT
-
-# --- LOGGING ---
-log_info()  { printf "${B}[INFO]${NC} %s\n" "$1"; }
-log_ok()    { printf "${G}[OK]${NC}   %s\n" "$1"; }
-log_warn()  { printf "${Y}[WARN]${NC} %s\n" "$1" >&2; }
-log_fatal() { printf "${R}[FATAL]${NC} %s\n" "$1" >&2; exit 1; }
-
-# --- DYNAMIC CONFIG RESOLUTION ---
-resolve_source() {
-    # Robustly find where this script actually lives, resolving symlinks
-    local source="${BASH_SOURCE[0]}"
-    while [ -h "$source" ]; do
-        local dir="$( cd -P "$( dirname "$source" )" >/dev/null 2>&1 && pwd )"
-        source="$(readlink "$source")"
-        [[ $source != /* ]] && source="$dir/$source"
-    done
-    echo "$( cd -P "$( dirname "$source" )" >/dev/null 2>&1 && pwd )"
+# FIX: Ensure debug always returns true to prevent set -e crashes
+debug() { 
+    if [[ "$VERBOSE_MODE" == "true" ]]; then
+        echo -e "\033[0;90m[DEBUG] $1\033[0m"
+    fi
+    return 0
 }
+
+check_deps() {
+    command -v jq >/dev/null 2>&1 || error "jq is required."
+    if [[ "$OS_TYPE" == "Linux" ]]; then
+        command -v curl >/dev/null 2>&1 || error "curl is required."
+    fi
+}
+
+# --- Credential Management ---
+
+credential_get() {
+    if [[ "$OS_TYPE" == "Darwin" ]]; then
+        if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null; then return 0; fi
+        if security find-generic-password -s "dfsync_github_token" -a "github_api" -w 2>/dev/null; then
+            local old_token
+            old_token=$(security find-generic-password -s "dfsync_github_token" -a "github_api" -w)
+            credential_save "$old_token"
+            echo "$old_token"
+            return 0
+        fi
+        return 1
+    else
+        [[ -f "$LINUX_TOKEN_FILE" ]] && cat "$LINUX_TOKEN_FILE" && return 0
+        return 1
+    fi
+}
+
+credential_save() {
+    local token="$1"
+    if [[ "$OS_TYPE" == "Darwin" ]]; then
+        security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$token"
+    else
+        echo "$token" > "$LINUX_TOKEN_FILE"
+        chmod 600 "$LINUX_TOKEN_FILE"
+    fi
+}
+
+# --- Core Functions ---
 
 get_config_path() {
-    # Priority 1: Environment Variable
-    if [[ -n "${DFSYNC_CONFIG:-}" ]]; then
-        echo "$DFSYNC_CONFIG"
+    if [[ ! -f "$CONFIG_POINTER" ]]; then
+        error "dfsync is not configured. Run 'dfsync setup' first."
+    fi
+    cat "$CONFIG_POINTER"
+}
+
+get_token() {
+    if ! credential_get; then
+        error "GitHub Token not found. Run 'dfsync setup' or 'dfsync config token'."
+    fi
+}
+
+ensure_valid_config() {
+    local config_file="$1"
+    if [[ ! -s "$config_file" ]]; then
+        debug "File is empty. Initializing..."
+        echo '{"gist_id": "", "files": []}' > "$config_file"
         return
     fi
 
-    # Priority 2: User Pointer File (Managed via 'config' command)
-    if [[ -f "$POINTER_FILE" ]]; then
-        local ptr
-        ptr=$(cat "$POINTER_FILE")
-        if [[ -f "$ptr" ]]; then
-            echo "$ptr"
-            return
-        fi
-    fi
+    # Validate JSON Syntax
+    local check_file
+    check_file=$(mktemp)
+    set +e
+    jq empty "$config_file" > "$check_file" 2>&1
+    local status=$?
+    set -e
 
-    # Priority 3: Local Fallback (Same dir as script)
-    local script_dir
-    script_dir=$(resolve_source)
-    if [[ -f "${script_dir}/config.json" ]]; then
-        echo "${script_dir}/config.json"
-        return
-    fi
-    
-    # Priority 4: XDG Default
-    if [[ -f "${XDG_CONFIG_HOME}/dfsync.json" ]]; then
-        echo "${XDG_CONFIG_HOME}/dfsync.json"
-        return
-    fi
-    
-    echo ""
-}
-
-# --- HELPERS ---
-check_deps() {
-    for cmd in jq curl; do command -v "$cmd" &>/dev/null || log_fatal "Missing dependency: $cmd"; done
-}
-
-get_os() { uname | tr '[:upper:]' '[:lower:]'; }
-
-to_gist_name() {
-    echo "$1" | sed "s|^~/||; s|/|.|g; s|^\.|__dot__|"
-}
-
-backup_file() {
-    local file="$1"
-    local suffix=".bak.$(date +%Y%m%d-%H%M%S)"
-    [[ -f "$file" ]] && cp -p "$file" "${file}${suffix}" && log_info "Backup created: ${file##*/}${suffix}"
-}
-
-keychain_op() {
-    local op="$1" user="$2" label="$3" pass="${4:-}"
-    local os=$(get_os)
-    if [[ "$os" == darwin* ]]; then
-        case "$op" in
-            add) security add-generic-password -a "$user" -s "$label" -w "$pass" -U ;;
-            get) security find-generic-password -wga "$user" -s "$label" 2>/dev/null ;;
-            del) security delete-generic-password -a "$user" -s "$label" ;;
-        esac
-    else
-        command -v secret-tool &>/dev/null || log_fatal "Linux requires 'libsecret-tools'."
-        case "$op" in
-            add) echo "$pass" | secret-tool store --label "$label" user "$user" usage "$label" ;;
-            get) secret-tool lookup user "$user" usage "$label" ;;
-            del) secret-tool clear user "$user" usage "$label" ;;
-        esac
-    fi
-}
-
-github_api() {
-    local method="$1" endpoint="$2" user="$3" token="$4" payload_file="${5:-}"
-    local output_file="${TMP_DIR}/response.json"
-    
-    local args=(--silent --show-error --write-out "%{http_code}" --output "$output_file" --user "${user}:${token}" --request "$method" --header "Accept: application/vnd.github.v3+json" --connect-timeout 10 --retry 3 --retry-delay 1)
-    [[ -n "$payload_file" ]] && args+=(--header "Content-Type: application/json" --data "@$payload_file")
-
-    local status
-    status=$(curl "${args[@]}" "${GITHUB_API}${endpoint}")
-
-    if [[ "$status" -ge 200 && "$status" -lt 300 ]]; then
-        cat "$output_file"
-    else
+    if [[ $status -ne 0 ]]; then
         local err_msg
-        err_msg=$(jq -r '.message // "Unknown Error"' "$output_file" 2>/dev/null)
-        log_fatal "GitHub API Error ($status): $err_msg"
+        err_msg=$(cat "$check_file")
+        rm "$check_file"
+        error "Config file is corrupted (Invalid JSON):\n$err_msg"
+    fi
+    rm "$check_file"
+
+    # Fix structure
+    local fix_file
+    fix_file=$(mktemp)
+    set +e
+    jq 'if (.files == null and .dotFilePaths == null) then .files = [] else . end' "$config_file" > "$fix_file"
+    status=$?
+    set -e
+    
+    if [[ $status -eq 0 ]]; then
+        mv "$fix_file" "$config_file"
+    else
+        rm "$fix_file"
+        error "Config repair failed."
     fi
 }
 
-# --- COMMANDS ---
+# --- Commands ---
 
-cmd_config() {
-    local action="${1:-show}"
-    local target="${2:-}"
+cmd_help() {
+    echo -e "Usage: dfsync [COMMAND] [OPTIONS]"
+    echo -e "\nCommands:"
+    echo -e "  setup            Initialize dfsync."
+    echo -e "  track <file>     Add a file to the sync list."
+    echo -e "  untrack <file>   Remove a file from the sync list."
+    echo -e "  push             Upload all tracked files to Gist."
+    echo -e "  pull             Download files from Gist."
+    echo -e "  config token     Update GitHub Token."
+    echo -e "  config path      Change config file location."
+    echo -e "  help             Show this guide."
+    echo -e "\nOptions:"
+    echo -e "  -y, --yes        Non-interactive mode."
+    echo -e "  -v, --verbose    Show detailed debug logs."
+}
 
-    mkdir -p "$STATE_DIR"
+cmd_setup() {
+    echo "--- dfsync Setup ($OS_TYPE) ---"
+    local default_path="$DEFAULT_CONFIG_PATH"
+    [[ -f "$CONFIG_POINTER" ]] && default_path=$(cat "$CONFIG_POINTER")
+    local config_path=""
+    
+    if [[ "$YES_MODE" == "true" ]]; then
+        config_path="$default_path"
+        log "Auto-accepting config path: $config_path"
+    else
+        read -p "Enter path for config file [$default_path]: " input_path
+        config_path=${input_path:-$default_path}
+    fi
+    
+    config_path="${config_path/#\~/$HOME}"
+    mkdir -p "$(dirname "$config_path")"
+    echo "$config_path" > "$CONFIG_POINTER"
+    success "Config path set to: $config_path"
+    
+    if [[ ! -f "$config_path" ]]; then
+        echo '{"gist_id": "", "files": []}' > "$config_path"
+        success "Created empty config file."
+    fi
 
-    case "$action" in
-        set|SET)
-            [[ -z "$target" ]] && log_fatal "Usage: dfsync config set /path/to/config.json"
-            # Resolve absolute path
-            target=$(cd "$(dirname "$target")"; pwd)/$(basename "$target")
-            if [[ ! -f "$target" ]]; then
-                log_warn "File does not exist: $target (Pointer set anyway)"
-            fi
-            echo "$target" > "$POINTER_FILE"
-            log_ok "Active config set to: $target"
-            ;;
-        show|SHOW)
-            local current=$(get_config_path)
-            if [[ -n "$current" ]]; then
-                log_info "Active Config: $current"
-                log_info "Content:"
-                # UPDATED: Show full content including paths
-                cat "$current" | jq .
-            else
-                log_warn "No active config found. (Search path: ENV -> POINTER -> LOCAL -> XDG)"
-            fi
-            ;;
-        *)
-            log_fatal "Unknown config action. Use 'set' or 'show'."
-            ;;
-    esac
+    if credential_get >/dev/null; then
+        [[ "$YES_MODE" != "true" ]] && log "Existing token found."
+    else
+        read -s -p "Enter GitHub Access Token (gist scope): " token
+        echo ""
+        [[ -n "$token" ]] && credential_save "$token" && success "Token saved." || warn "No token entered."
+    fi
+}
+
+cmd_config_token() {
+    local token="$1"
+    [[ -z "$token" ]] && read -s -p "Enter new GitHub Access Token: " token && echo ""
+    [[ -z "$token" ]] && error "Token cannot be empty."
+    credential_save "$token"
+    success "Token updated."
+}
+
+cmd_config_path() {
+    local path="$1"
+    [[ -z "$path" ]] && error "Usage: dfsync config path <absolute_path>"
+    path="${path/#\~/$HOME}"
+    echo "$path" > "$CONFIG_POINTER"
+    success "Config path updated to: $path"
+}
+
+cmd_track() {
+    check_deps
+    local file="$1"
+    [[ -z "$file" ]] && error "Usage: dfsync track <path_to_file>"
+    local config_file
+    config_file=$(get_config_path)
+    ensure_valid_config "$config_file"
+    local clean_path="${file/$HOME/\~}"
+    local tmp
+    tmp=$(mktemp)
+    
+    set +e
+    jq --arg f "$clean_path" 'if .dotFilePaths then .dotFilePaths += [$f] | .dotFilePaths |= unique else (.files // []) + [$f] | .files |= unique end' "$config_file" > "$tmp"
+    local status=$?
+    set -e
+
+    if [[ $status -eq 0 ]]; then
+        mv "$tmp" "$config_file"
+        success "Now tracking: $clean_path"
+    else
+        rm -f "$tmp"
+        error "Failed to update config."
+    fi
+}
+
+cmd_untrack() {
+    check_deps
+    local file="$1"
+    [[ -z "$file" ]] && error "Usage: dfsync untrack <path_to_file>"
+    local config_file
+    config_file=$(get_config_path)
+    ensure_valid_config "$config_file"
+    local clean_path="${file/$HOME/\~}"
+    local tmp
+    tmp=$(mktemp)
+    
+    set +e
+    jq --arg f "$clean_path" 'if .dotFilePaths then .dotFilePaths |= map(select(. != $f)) else (.files // []) |= map(select(. != $f)) end' "$config_file" > "$tmp"
+    local status=$?
+    set -e
+
+    if [[ $status -eq 0 ]]; then
+        mv "$tmp" "$config_file"
+        success "No longer tracking: $clean_path"
+    else
+        rm -f "$tmp"
+        error "Failed to update config."
+    fi
 }
 
 cmd_push() {
-    local auto_yes="${1:-}"
     local config_file
     config_file=$(get_config_path)
-
-    [[ -z "$config_file" ]] && log_fatal "Config not found. Run 'dfsync config set <path>'."
+    ensure_valid_config "$config_file"
+    local token
+    token=$(get_token)
     
-    local config=$(cat "$config_file")
-    local user=$(echo "$config" | jq -r ".githubUser")
-    local gist_id=$(echo "$config" | jq -r ".gistId")
-    local token=$(keychain_op get "$user" "dotfiles_sync")
-    [[ -z "$token" ]] && log_fatal "No API token found for user: $user"
+    log "Reading config from $config_file..."
+    
+    if [[ "$VERBOSE_MODE" == "true" ]]; then
+        echo -e "\033[0;90m[DEBUG] Config Content:\033[0m"
+        cat "$config_file"
+    fi
 
-    log_info "Analyzing changes using config: $(basename "$config_file")"
-    local payload_json="${TMP_DIR}/payload.json"
-    echo '{ "files": {} }' > "$payload_json"
-    local count=0
+    local count_file
+    count_file=$(mktemp)
+    
+    set +e
+    jq '(.files // .dotFilePaths // []) | length' "$config_file" > "$count_file" 2>&1
+    local jq_status=$?
+    set -e
 
-    while IFS= read -r filepath; do
-        [[ -z "$filepath" ]] && continue
-        local local_path="${filepath/#\~/$HOME}"
-        local gist_name=$(to_gist_name "$filepath")
+    if [[ $jq_status -ne 0 ]]; then
+        local err_msg
+        err_msg=$(cat "$count_file")
+        rm "$count_file"
+        error "jq failed to read file list: $err_msg"
+    fi
+    
+    local file_count
+    read -r file_count < "$count_file"
+    rm "$count_file"
+    
+    debug "Found $file_count tracked files."
+    
+    if [[ "$file_count" == "0" ]]; then
+        warn "No files to sync. Add files using 'dfsync track <file>'."
+        return 0
+    fi
+    
+    local gist_id
+    gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_file" || echo "")
+    debug "Current Gist ID: ${gist_id:-'(None)'}"
 
-        if [[ "$auto_yes" != "-y" && "$auto_yes" != "--yes" ]]; then
-            printf "${C}? Push ${filepath}?${NC} [y/N] "
-            read -r confirm < /dev/tty
-            [[ ! "$confirm" =~ ^[Yy] ]] && continue
-        fi
+    local payload_file
+    payload_file=$(mktemp)
+    echo '{ "description": "dfsync backup", "files": {} }' > "$payload_file"
+    
+    log "Packing files..."
+    local list_file
+    list_file=$(mktemp)
+    
+    set +e
+    jq -r '(.files // .dotFilePaths // [])[]' "$config_file" > "$list_file"
+    set -e
 
-        if [[ -f "$local_path" && -s "$local_path" ]]; then
-            local temp_acc="${TMP_DIR}/acc.json"
-            jq --arg fn "$gist_name" --rawfile content "$local_path" '.files += { ($fn): { "content": $content } }' "$payload_json" > "$temp_acc" && mv "$temp_acc" "$payload_json"
-            ((count++))
-            log_ok "Queued: $filepath"
+    while read -r filepath; do
+        local abs_path="${filepath/#\~/$HOME}"
+        local flat_name
+        flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
+        
+        if [[ -f "$abs_path" ]]; then
+            debug "Processing: $filepath"
+            [[ "$VERBOSE_MODE" != "true" ]] && echo -n "."
+            
+            local content_file
+            content_file=$(mktemp)
+            set +e
+            jq -Rs . < "$abs_path" > "$content_file"
+            local read_status=$?
+            set -e
+
+            if [[ $read_status -eq 0 ]]; then
+                local tmp_payload
+                tmp_payload=$(mktemp)
+                set +e
+                jq --arg fn "$flat_name" --slurpfile c "$content_file" '.files[$fn] = {content: $c[0]}' "$payload_file" > "$tmp_payload"
+                local update_status=$?
+                set -e
+                
+                if [[ $update_status -eq 0 ]]; then
+                    mv "$tmp_payload" "$payload_file"
+                else
+                    rm "$tmp_payload"
+                fi
+            fi
+            rm "$content_file"
         else
-            log_warn "Skipped (Missing/Empty): $filepath"
+            warn "File not found (skipping): $abs_path"
         fi
-    done < <(echo "$config" | jq -r '.dotFilePaths[]')
+    done < "$list_file"
+    rm "$list_file"
 
-    [[ "$count" -eq 0 ]] && { log_warn "Nothing to sync."; return 0; }
+    [[ "$VERBOSE_MODE" != "true" ]] && echo ""
+    
+    local payload_size
+    payload_size=$(wc -c < "$payload_file" | tr -d ' ')
+    debug "Payload size: $payload_size bytes"
+    
+    log "Uploading to GitHub..."
+    local response_body
+    response_body=$(mktemp)
+    local http_code
+    
+    # FIX: Safety wrapper for curl
+    set +e
+    if [[ -z "$gist_id" ]]; then
+        debug "POST https://api.github.com/gists"
+        http_code=$(curl -s -w "%{http_code}" -o "$response_body" -H "Authorization: token $token" -X POST -d @"$payload_file" "https://api.github.com/gists")
+    else
+        debug "PATCH https://api.github.com/gists/$gist_id"
+        http_code=$(curl -s -w "%{http_code}" -o "$response_body" -H "Authorization: token $token" -X PATCH -d @"$payload_file" "https://api.github.com/gists/$gist_id")
+    fi
+    local curl_status=$?
+    set -e
+    
+    debug "HTTP Status: $http_code (Exit Code: $curl_status)"
+    
+    if [[ $curl_status -ne 0 ]]; then
+        error "Network error. curl exited with code $curl_status"
+    fi
 
-    log_info "Uploading $count files..."
-    github_api "PATCH" "/gists/$gist_id" "$user" "$token" "$payload_json" > /dev/null
-    log_ok "Sync Complete."
+    if [[ "$http_code" == "201" ]] || [[ "$http_code" == "200" ]]; then
+        if [[ -z "$gist_id" ]]; then
+            local new_id
+            new_id=$(jq -r '.id' "$response_body")
+            local tmp
+            tmp=$(mktemp)
+            set +e
+            jq --arg id "$new_id" 'if .gistId then .gistId = $id else .gist_id = $id end' "$config_file" > "$tmp" && mv "$tmp" "$config_file"
+            set -e
+            success "Created new Gist: $new_id"
+        else
+            success "Gist $gist_id updated successfully."
+        fi
+    else
+        error "GitHub API Error ($http_code). Response: $(cat "$response_body")"
+    fi
+    rm -f "$payload_file" "$response_body"
 }
 
 cmd_pull() {
-    local auto_yes="${1:-}"
     local config_file
     config_file=$(get_config_path)
+    ensure_valid_config "$config_file"
+    local token
+    token=$(get_token)
+    local gist_id
+    gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_file")
+    
+    [[ -z "$gist_id" ]] && error "No Gist ID found in config."
+    log "Fetching Gist $gist_id..."
+    debug "GET https://api.github.com/gists/$gist_id"
+    
+    local response_body
+    response_body=$(mktemp)
+    local http_code
+    
+    # FIX: Safety wrapper for curl
+    set +e
+    http_code=$(curl -s -w "%{http_code}" -o "$response_body" -H "Authorization: token $token" "https://api.github.com/gists/$gist_id")
+    local curl_status=$?
+    set -e
+    
+    debug "HTTP Status: $http_code"
+    
+    if [[ $curl_status -ne 0 ]]; then
+        error "Network error. curl exited with code $curl_status"
+    fi
 
-    [[ -z "$config_file" ]] && log_fatal "Config not found."
+    if [[ "$http_code" != "200" ]]; then
+        error "Failed to fetch Gist ($http_code). Response: $(cat "$response_body")"
+    fi
+    
+    log "Restoring files..."
+    local list_file
+    list_file=$(mktemp)
+    set +e
+    jq -r '(.files // .dotFilePaths // [])[]' "$config_file" > "$list_file"
+    set -e
 
-    local config=$(cat "$config_file")
-    local user=$(echo "$config" | jq -r ".githubUser")
-    local gist_id=$(echo "$config" | jq -r ".gistId")
-    local token=$(keychain_op get "$user" "dotfiles_sync")
-
-    log_info "Fetching Gist..."
-    local resp
-    resp=$(github_api "GET" "/gists/$gist_id" "$user" "$token")
-    local count=0
-
-    while IFS= read -r filepath; do
-        local local_path="${filepath/#\~/$HOME}"
-        local gist_name=$(to_gist_name "$filepath")
+    while read -r filepath; do
+        local abs_path="${filepath/#\~/$HOME}"
+        local flat_name
+        flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
         local content
-        content=$(echo "$resp" | jq -r ".files[\"$gist_name\"].content // empty")
-
+        content=$(jq -r --arg fn "$flat_name" '.files[$fn].content // empty' "$response_body")
+        
         if [[ -n "$content" ]]; then
-            if [[ -f "$local_path" && "$auto_yes" != "-y" && "$auto_yes" != "--yes" ]]; then
-                printf "${Y}! Overwrite ${filepath}?${NC} [y/N] "
-                read -r confirm < /dev/tty
-                [[ ! "$confirm" =~ ^[Yy] ]] && continue
-            fi
-            mkdir -p "$(dirname "$local_path")"
-            backup_file "$local_path"
-            echo "$content" > "$local_path"
-            log_ok "Restored: $filepath"
-            ((count++))
+            debug "Restoring: $flat_name -> $abs_path"
+            mkdir -p "$(dirname "$abs_path")"
+            echo "$content" > "$abs_path"
+            success "Restored: $filepath"
+        else
+            warn "Not found in Gist: $flat_name"
         fi
-    done < <(echo "$config" | jq -r '.dotFilePaths[]')
-    log_info "Restored $count files."
+    done < "$list_file"
+    rm "$list_file"
+    rm -f "$response_body"
 }
 
-# --- ENTRY POINT ---
-check_deps
-case "${1:-}" in
-    push|PUSH)   cmd_push "${2:-}" ;;
-    pull|PULL)   cmd_pull "${2:-}" ;;
-    config|CONFIG) cmd_config "${2:-}" "${3:-}" ;;
-    *) echo "Usage: dfsync {push|pull} [-y] OR dfsync config {set|show}"; exit 1 ;;
+# --- Flexible Argument Parser ---
+# Collects commands and flags regardless of order
+ARGS=()
+for arg in "$@"; do
+    case $arg in
+        -y|--yes) YES_MODE=true ;;
+        -v|--verbose) VERBOSE_MODE=true ;;
+        -*) echo "Unknown option: $arg"; exit 1 ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+
+if [[ ${#ARGS[@]} -eq 0 ]]; then
+    cmd_help
+    exit 0
+fi
+
+COMMAND="${ARGS[0]}"
+shift # Shift isn't strictly needed for array access but good habit if using $1 later (unused here)
+ARG_1="${ARGS[1]}" # For sub-commands like 'config token'
+
+case "$COMMAND" in
+    setup) cmd_setup ;;
+    config)
+        case "$ARG_1" in
+            token) cmd_config_token "${ARGS[2]}" ;;
+            path) cmd_config_path "${ARGS[2]}" ;;
+            *) error "Unknown config command. Use: token, path" ;;
+        esac
+        ;;
+    track) cmd_track "$ARG_1" ;;
+    untrack) cmd_untrack "$ARG_1" ;;
+    push) cmd_push ;;
+    pull) cmd_pull ;;
+    help|*) cmd_help ;;
 esac
