@@ -1,6 +1,6 @@
 #!/bin/bash
 # dfsync - Dotfile Sync to Gist
-# v3.5 - The Array Strategy (Fixes skipped prompts by freeing stdin)
+# v3.9 - Recursive Discovery + Restored Verbose/Debug Logic
 
 set -e
 
@@ -32,24 +32,12 @@ debug() {
     return 0
 }
 
-# Returns 0 (true) if action should proceed, 1 (false) if skipped
 confirm() {
     local prompt="$1"
-    
-    # 1. Check Batch Mode
-    if [[ "$YES_MODE" == "true" ]]; then
-        return 0
-    fi
-    
-    # 2. Interactive Mode (Standard Input is now free)
+    if [[ "$YES_MODE" == "true" ]]; then return 0; fi
     local response
     read -p "$prompt [y/N] " response
-    
-    if [[ "$response" =~ ^[Yy]$ ]]; then
-        return 0
-    else
-        return 1
-    fi
+    if [[ "$response" =~ ^[Yy]$ ]]; then return 0; else return 1; fi
 }
 
 check_deps() {
@@ -65,8 +53,7 @@ credential_get() {
     if [[ "$OS_TYPE" == "Darwin" ]]; then
         if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null; then return 0; fi
         if security find-generic-password -s "dfsync_github_token" -a "github_api" -w 2>/dev/null; then
-            local old_token
-            old_token=$(security find-generic-password -s "dfsync_github_token" -a "github_api" -w)
+            local old_token=$(security find-generic-password -s "dfsync_github_token" -a "github_api" -w)
             credential_save "$old_token"
             echo "$old_token"
             return 0
@@ -111,25 +98,22 @@ ensure_valid_config() {
         return
     fi
 
-    local check_file
-    check_file=$(mktemp)
+    local check_file=$(mktemp)
     set +e
     jq empty "$config_file" > "$check_file" 2>&1
     local status=$?
     set -e
 
     if [[ $status -ne 0 ]]; then
-        local err_msg
-        err_msg=$(cat "$check_file")
+        local err_msg=$(cat "$check_file")
         rm "$check_file"
         error "Config file is corrupted (Invalid JSON):\n$err_msg"
     fi
     rm "$check_file"
 
-    local fix_file
-    fix_file=$(mktemp)
+    local fix_file=$(mktemp)
     set +e
-    jq 'if (.files == null and .dotFilePaths == null) then .files = [] else . end' "$config_file" > "$fix_file"
+    jq 'if type=="array" then {files: ., gist_id: ""} elif (.files == null and .dotFilePaths == null) then .files = [] else . end' "$config_file" > "$fix_file"
     status=$?
     set -e
     
@@ -155,7 +139,7 @@ cmd_help() {
     echo -e "  config path      Change config file location."
     echo -e "  help             Show this guide."
     echo -e "\nOptions:"
-    echo -e "  -y, --yes        Auto-confirm all prompts (Non-interactive)."
+    echo -e "  -y, --yes        Auto-confirm all prompts (Batch Mode)."
     echo -e "  -v, --verbose    Show detailed debug logs."
 }
 
@@ -190,6 +174,24 @@ cmd_setup() {
         echo ""
         [[ -n "$token" ]] && credential_save "$token" && success "Token saved." || warn "No token entered."
     fi
+
+    ensure_valid_config "$config_path"
+    local current_gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_path")
+
+    if [[ -n "$current_gist_id" ]]; then
+        [[ "$YES_MODE" != "true" ]] && log "Existing Gist ID found: $current_gist_id"
+    else
+        if [[ "$YES_MODE" != "true" ]]; then
+            local input_gist_id
+            echo -e "\nRestore: Do you have an existing Gist ID?"
+            read -p "Enter Gist ID (Leave empty to create new on push): " input_gist_id
+            if [[ -n "$input_gist_id" ]]; then
+                local tmp=$(mktemp)
+                jq --arg id "$input_gist_id" '.gist_id = $id' "$config_path" > "$tmp" && mv "$tmp" "$config_path"
+                success "Gist ID saved."
+            fi
+        fi
+    fi
 }
 
 cmd_config_token() {
@@ -210,22 +212,25 @@ cmd_config_path() {
 
 cmd_track() {
     check_deps
-    local file="$1"
-    [[ -z "$file" ]] && error "Usage: dfsync track <path_to_file>"
-    local config_file
-    config_file=$(get_config_path)
-    ensure_valid_config "$config_file"
+    local path="$1"
+    [[ -z "$path" ]] && error "Usage: dfsync track <path_to_file_or_dir>"
     
-    local clean_path="${file/$HOME/\~}"
-    local tmp
-    tmp=$(mktemp)
+    if [[ -d "$path" ]]; then
+        log "Directory detected. Scanning: $(echo "$path" | sed "s|$HOME|~|")"
+        find "$path" -type f -not -path '*/.*' -not -name ".DS_Store" | while read -r subfile; do
+            "$0" track "$subfile"
+        done
+        return
+    fi
+
+    local config_file=$(get_config_path)
+    ensure_valid_config "$config_file"
+    local clean_path="${path/$HOME/\~}"
+    local tmp=$(mktemp)
     
     debug "Tracking file: $clean_path"
 
     set +e
-    # 1. If root is an array, wrap it in {files: []}
-    # 2. If .files is null, initialize it
-    # 3. Add the new file and keep unique
     jq --arg f "$clean_path" '
         (if type == "array" then {files: ., gist_id: ""} else . end)
         | .files |= (if . == null then [] else . end | . + [$f] | unique)
@@ -238,21 +243,18 @@ cmd_track() {
         success "Now tracking: $clean_path"
     else
         rm -f "$tmp"
-        error "Failed to update config. Check if JSON is valid."
+        error "Failed to update config."
     fi
 }
 
 cmd_untrack() {
     check_deps
-    local file="$1"
-    [[ -z "$file" ]] && error "Usage: dfsync untrack <path_to_file>"
-    local config_file
-    config_file=$(get_config_path)
+    local path="$1"
+    [[ -z "$path" ]] && error "Usage: dfsync untrack <path>"
+    local config_file=$(get_config_path)
     ensure_valid_config "$config_file"
-    
-    local clean_path="${file/$HOME/\~}"
-    local tmp
-    tmp=$(mktemp)
+    local clean_path="${path/$HOME/\~}"
+    local tmp=$(mktemp)
     
     set +e
     jq --arg f "$clean_path" '
@@ -272,92 +274,62 @@ cmd_untrack() {
 }
 
 cmd_push() {
-    local config_file
-    config_file=$(get_config_path)
+    local config_file=$(get_config_path)
     ensure_valid_config "$config_file"
-    local token
-    token=$(get_token)
+    local token=$(get_token)
     
     log "Reading config from $config_file..."
-    
-    local count_file
-    count_file=$(mktemp)
-    
+    local count_file=$(mktemp)
     set +e
     jq '(.files // .dotFilePaths // []) | length' "$config_file" > "$count_file" 2>&1
     local jq_status=$?
     set -e
 
-    if [[ $jq_status -ne 0 ]]; then
-        local err_msg
-        err_msg=$(cat "$count_file")
-        rm "$count_file"
-        error "jq failed to read file list: $err_msg"
-    fi
+    if [[ $jq_status -ne 0 ]]; then error "jq failed to read file list."; fi
     
-    local file_count
-    read -r file_count < "$count_file"
-    rm "$count_file"
-    
+    local file_count; read -r file_count < "$count_file"; rm "$count_file"
     debug "Found $file_count tracked files."
     
     if [[ "$file_count" == "0" ]]; then
-        warn "No files to sync. Add files using 'dfsync track <file>'."
+        warn "No files to sync. Use 'dfsync track <file>'."
         return 0
     fi
     
-    local gist_id
-    gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_file" || echo "")
-    
-    # Payload Construction
-    local payload_file
-    payload_file=$(mktemp)
+    local gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_file" || echo "")
+    local payload_file=$(mktemp)
     echo '{ "description": "dfsync backup", "files": {} }' > "$payload_file"
     
     log "Preparing upload..."
-    local list_file
-    list_file=$(mktemp)
-    
-    # Dump files to temporary list
+    local list_file=$(mktemp)
     set +e
     jq -r '(.files // .dotFilePaths // [])[]' "$config_file" > "$list_file"
     set -e
 
-    # LOAD INTO ARRAY (Crucial: Frees stdin for prompts)
     local TARGET_FILES=()
-    while IFS= read -r line; do
-        TARGET_FILES+=("$line")
-    done < "$list_file"
-    rm "$list_file"
+    while IFS= read -r line; do TARGET_FILES+=("$line"); done < "$list_file"; rm "$list_file"
 
     local files_packed=0
-
-    # Iterate Array
     for filepath in "${TARGET_FILES[@]}"; do
         local abs_path="${filepath/#\~/$HOME}"
-        local flat_name
-        flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
+        local flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
         
         if [[ -f "$abs_path" ]]; then
             if confirm "Upload $filepath?"; then
                 debug "Processing: $filepath"
                 [[ "$VERBOSE_MODE" != "true" ]] && echo -n "."
                 
-                local content_file
-                content_file=$(mktemp)
+                local content_file=$(mktemp)
                 set +e
                 jq -Rs . < "$abs_path" > "$content_file"
                 local read_status=$?
                 set -e
 
                 if [[ $read_status -eq 0 ]]; then
-                    local tmp_payload
-                    tmp_payload=$(mktemp)
+                    local tmp_payload=$(mktemp)
                     set +e
                     jq --arg fn "$flat_name" --slurpfile c "$content_file" '.files[$fn] = {content: $c[0]}' "$payload_file" > "$tmp_payload"
                     local update_status=$?
                     set -e
-                    
                     if [[ $update_status -eq 0 ]]; then
                         mv "$tmp_payload" "$payload_file"
                         ((files_packed++))
@@ -367,7 +339,7 @@ cmd_push() {
                 fi
                 rm "$content_file"
             else
-                [[ "$VERBOSE_MODE" == "true" ]] && echo "Skipping: $filepath"
+                debug "Skipping: $filepath"
             fi
         else
             warn "File not found (skipping): $abs_path"
@@ -377,45 +349,29 @@ cmd_push() {
     [[ "$VERBOSE_MODE" != "true" ]] && echo ""
     
     if [[ $files_packed -eq 0 ]]; then
-        log "No files selected for upload. Aborting."
-        rm "$payload_file"
-        return 0
+        log "No files selected. Aborting."; rm "$payload_file"; return 0
     fi
 
-    log "Uploading $files_packed files to GitHub..."
-    local response_body
-    response_body=$(mktemp)
+    log "Uploading $files_packed files..."
+    local response_body=$(mktemp)
     local http_code
     
     set +e
     if [[ -z "$gist_id" ]]; then
-        debug "POST https://api.github.com/gists"
         http_code=$(curl -s -w "%{http_code}" -o "$response_body" -H "Authorization: token $token" -X POST -d @"$payload_file" "https://api.github.com/gists")
     else
-        debug "PATCH https://api.github.com/gists/$gist_id"
         http_code=$(curl -s -w "%{http_code}" -o "$response_body" -H "Authorization: token $token" -X PATCH -d @"$payload_file" "https://api.github.com/gists/$gist_id")
     fi
-    local curl_status=$?
     set -e
     
-    debug "HTTP Status: $http_code (Exit Code: $curl_status)"
-    
-    if [[ $curl_status -ne 0 ]]; then
-        error "Network error. curl exited with code $curl_status"
-    fi
-
     if [[ "$http_code" == "201" ]] || [[ "$http_code" == "200" ]]; then
         if [[ -z "$gist_id" ]]; then
-            local new_id
-            new_id=$(jq -r '.id' "$response_body")
-            local tmp
-            tmp=$(mktemp)
-            set +e
-            jq --arg id "$new_id" 'if .gistId then .gistId = $id else .gist_id = $id end' "$config_file" > "$tmp" && mv "$tmp" "$config_file"
-            set -e
+            local new_id=$(jq -r '.id' "$response_body")
+            local tmp=$(mktemp)
+            jq --arg id "$new_id" '.gist_id = $id' "$config_file" > "$tmp" && mv "$tmp" "$config_file"
             success "Created new Gist: $new_id"
         else
-            success "Gist $gist_id updated successfully."
+            success "Gist $gist_id updated."
         fi
     else
         error "GitHub API Error ($http_code). Response: $(cat "$response_body")"
@@ -424,54 +380,33 @@ cmd_push() {
 }
 
 cmd_pull() {
-    local config_file
-    config_file=$(get_config_path)
+    local config_file=$(get_config_path)
     ensure_valid_config "$config_file"
-    local token
-    token=$(get_token)
-    local gist_id
-    gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_file")
+    local token=$(get_token)
+    local gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_file")
     
-    [[ -z "$gist_id" ]] && error "No Gist ID found in config."
+    [[ -z "$gist_id" ]] && error "No Gist ID found."
     log "Fetching Gist $gist_id..."
     
-    local response_body
-    response_body=$(mktemp)
+    local response_body=$(mktemp)
     local http_code
-    
     set +e
     http_code=$(curl -s -w "%{http_code}" -o "$response_body" -H "Authorization: token $token" "https://api.github.com/gists/$gist_id")
-    local curl_status=$?
     set -e
     
-    if [[ $curl_status -ne 0 ]]; then
-        error "Network error. curl exited with code $curl_status"
-    fi
-
-    if [[ "$http_code" != "200" ]]; then
-        error "Failed to fetch Gist ($http_code). Response: $(cat "$response_body")"
-    fi
+    if [[ "$http_code" != "200" ]]; then error "Failed to fetch Gist ($http_code)."; fi
     
     log "Restoring files..."
-    local list_file
-    list_file=$(mktemp)
-    set +e
+    local list_file=$(mktemp)
     jq -r '(.files // .dotFilePaths // [])[]' "$config_file" > "$list_file"
-    set -e
 
-    # LOAD INTO ARRAY (Frees stdin)
     local TARGET_FILES=()
-    while IFS= read -r line; do
-        TARGET_FILES+=("$line")
-    done < "$list_file"
-    rm "$list_file"
+    while IFS= read -r line; do TARGET_FILES+=("$line"); done < "$list_file"; rm "$list_file"
 
     for filepath in "${TARGET_FILES[@]}"; do
         local abs_path="${filepath/#\~/$HOME}"
-        local flat_name
-        flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
-        local content
-        content=$(jq -r --arg fn "$flat_name" '.files[$fn].content // empty' "$response_body")
+        local flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
+        local content=$(jq -r --arg fn "$flat_name" '.files[$fn].content // empty' "$response_body")
         
         if [[ -n "$content" ]]; then
             if confirm "Overwrite $filepath?"; then
@@ -480,30 +415,24 @@ cmd_pull() {
                 echo "$content" > "$abs_path"
                 success "Restored: $filepath"
             else
-                [[ "$VERBOSE_MODE" == "true" ]] && echo "Skipped: $filepath"
+                debug "Skipped: $filepath"
             fi
-        else
-            warn "Not found in Gist: $flat_name"
         fi
     done
     rm -f "$response_body"
 }
 
-# --- Flexible Argument Parser ---
+# --- Router ---
 ARGS=()
 for arg in "$@"; do
     case $arg in
         -y|--yes) YES_MODE=true ;;
         -v|--verbose) VERBOSE_MODE=true ;;
-        -*) echo "Unknown option: $arg"; exit 1 ;;
         *) ARGS+=("$arg") ;;
     esac
 done
 
-if [[ ${#ARGS[@]} -eq 0 ]]; then
-    cmd_help
-    exit 0
-fi
+[[ ${#ARGS[@]} -eq 0 ]] && cmd_help && exit 0
 
 COMMAND="${ARGS[0]}"
 shift
@@ -515,7 +444,7 @@ case "$COMMAND" in
         case "$ARG_1" in
             token) cmd_config_token "${ARGS[2]}" ;;
             path) cmd_config_path "${ARGS[2]}" ;;
-            *) error "Unknown config command. Use: token, path" ;;
+            *) error "Unknown config command." ;;
         esac
         ;;
     track) cmd_track "$ARG_1" ;;
@@ -524,3 +453,4 @@ case "$COMMAND" in
     pull) cmd_pull ;;
     help|*) cmd_help ;;
 esac
+EOF
