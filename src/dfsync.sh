@@ -1,6 +1,6 @@
 #!/bin/bash
 # dfsync - Dotfile Sync to Gist
-# v3.3 - Debug Crash Fix & Flexible Argument Parsing
+# v3.5 - The Array Strategy (Fixes skipped prompts by freeing stdin)
 
 set -e
 
@@ -25,12 +25,31 @@ success() { echo -e "\033[0;32m[OK]\033[0m $1"; }
 error() { echo -e "\033[0;31m[ERROR]\033[0m $1"; exit 1; }
 warn() { echo -e "\033[0;33m[WARN]\033[0m $1"; }
 
-# FIX: Ensure debug always returns true to prevent set -e crashes
 debug() { 
     if [[ "$VERBOSE_MODE" == "true" ]]; then
         echo -e "\033[0;90m[DEBUG] $1\033[0m"
     fi
     return 0
+}
+
+# Returns 0 (true) if action should proceed, 1 (false) if skipped
+confirm() {
+    local prompt="$1"
+    
+    # 1. Check Batch Mode
+    if [[ "$YES_MODE" == "true" ]]; then
+        return 0
+    fi
+    
+    # 2. Interactive Mode (Standard Input is now free)
+    local response
+    read -p "$prompt [y/N] " response
+    
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 check_deps() {
@@ -92,7 +111,6 @@ ensure_valid_config() {
         return
     fi
 
-    # Validate JSON Syntax
     local check_file
     check_file=$(mktemp)
     set +e
@@ -108,7 +126,6 @@ ensure_valid_config() {
     fi
     rm "$check_file"
 
-    # Fix structure
     local fix_file
     fix_file=$(mktemp)
     set +e
@@ -138,7 +155,7 @@ cmd_help() {
     echo -e "  config path      Change config file location."
     echo -e "  help             Show this guide."
     echo -e "\nOptions:"
-    echo -e "  -y, --yes        Non-interactive mode."
+    echo -e "  -y, --yes        Auto-confirm all prompts (Non-interactive)."
     echo -e "  -v, --verbose    Show detailed debug logs."
 }
 
@@ -250,11 +267,6 @@ cmd_push() {
     
     log "Reading config from $config_file..."
     
-    if [[ "$VERBOSE_MODE" == "true" ]]; then
-        echo -e "\033[0;90m[DEBUG] Config Content:\033[0m"
-        cat "$config_file"
-    fi
-
     local count_file
     count_file=$(mktemp)
     
@@ -283,69 +295,85 @@ cmd_push() {
     
     local gist_id
     gist_id=$(jq -r '.gist_id // .gistId // empty' "$config_file" || echo "")
-    debug "Current Gist ID: ${gist_id:-'(None)'}"
-
+    
+    # Payload Construction
     local payload_file
     payload_file=$(mktemp)
     echo '{ "description": "dfsync backup", "files": {} }' > "$payload_file"
     
-    log "Packing files..."
+    log "Preparing upload..."
     local list_file
     list_file=$(mktemp)
     
+    # Dump files to temporary list
     set +e
     jq -r '(.files // .dotFilePaths // [])[]' "$config_file" > "$list_file"
     set -e
 
-    while read -r filepath; do
+    # LOAD INTO ARRAY (Crucial: Frees stdin for prompts)
+    local TARGET_FILES=()
+    while IFS= read -r line; do
+        TARGET_FILES+=("$line")
+    done < "$list_file"
+    rm "$list_file"
+
+    local files_packed=0
+
+    # Iterate Array
+    for filepath in "${TARGET_FILES[@]}"; do
         local abs_path="${filepath/#\~/$HOME}"
         local flat_name
         flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
         
         if [[ -f "$abs_path" ]]; then
-            debug "Processing: $filepath"
-            [[ "$VERBOSE_MODE" != "true" ]] && echo -n "."
-            
-            local content_file
-            content_file=$(mktemp)
-            set +e
-            jq -Rs . < "$abs_path" > "$content_file"
-            local read_status=$?
-            set -e
-
-            if [[ $read_status -eq 0 ]]; then
-                local tmp_payload
-                tmp_payload=$(mktemp)
-                set +e
-                jq --arg fn "$flat_name" --slurpfile c "$content_file" '.files[$fn] = {content: $c[0]}' "$payload_file" > "$tmp_payload"
-                local update_status=$?
-                set -e
+            if confirm "Upload $filepath?"; then
+                debug "Processing: $filepath"
+                [[ "$VERBOSE_MODE" != "true" ]] && echo -n "."
                 
-                if [[ $update_status -eq 0 ]]; then
-                    mv "$tmp_payload" "$payload_file"
-                else
-                    rm "$tmp_payload"
+                local content_file
+                content_file=$(mktemp)
+                set +e
+                jq -Rs . < "$abs_path" > "$content_file"
+                local read_status=$?
+                set -e
+
+                if [[ $read_status -eq 0 ]]; then
+                    local tmp_payload
+                    tmp_payload=$(mktemp)
+                    set +e
+                    jq --arg fn "$flat_name" --slurpfile c "$content_file" '.files[$fn] = {content: $c[0]}' "$payload_file" > "$tmp_payload"
+                    local update_status=$?
+                    set -e
+                    
+                    if [[ $update_status -eq 0 ]]; then
+                        mv "$tmp_payload" "$payload_file"
+                        ((files_packed++))
+                    else
+                        rm "$tmp_payload"
+                    fi
                 fi
+                rm "$content_file"
+            else
+                [[ "$VERBOSE_MODE" == "true" ]] && echo "Skipping: $filepath"
             fi
-            rm "$content_file"
         else
             warn "File not found (skipping): $abs_path"
         fi
-    done < "$list_file"
-    rm "$list_file"
+    done
 
     [[ "$VERBOSE_MODE" != "true" ]] && echo ""
     
-    local payload_size
-    payload_size=$(wc -c < "$payload_file" | tr -d ' ')
-    debug "Payload size: $payload_size bytes"
-    
-    log "Uploading to GitHub..."
+    if [[ $files_packed -eq 0 ]]; then
+        log "No files selected for upload. Aborting."
+        rm "$payload_file"
+        return 0
+    fi
+
+    log "Uploading $files_packed files to GitHub..."
     local response_body
     response_body=$(mktemp)
     local http_code
     
-    # FIX: Safety wrapper for curl
     set +e
     if [[ -z "$gist_id" ]]; then
         debug "POST https://api.github.com/gists"
@@ -393,19 +421,15 @@ cmd_pull() {
     
     [[ -z "$gist_id" ]] && error "No Gist ID found in config."
     log "Fetching Gist $gist_id..."
-    debug "GET https://api.github.com/gists/$gist_id"
     
     local response_body
     response_body=$(mktemp)
     local http_code
     
-    # FIX: Safety wrapper for curl
     set +e
     http_code=$(curl -s -w "%{http_code}" -o "$response_body" -H "Authorization: token $token" "https://api.github.com/gists/$gist_id")
     local curl_status=$?
     set -e
-    
-    debug "HTTP Status: $http_code"
     
     if [[ $curl_status -ne 0 ]]; then
         error "Network error. curl exited with code $curl_status"
@@ -422,7 +446,14 @@ cmd_pull() {
     jq -r '(.files // .dotFilePaths // [])[]' "$config_file" > "$list_file"
     set -e
 
-    while read -r filepath; do
+    # LOAD INTO ARRAY (Frees stdin)
+    local TARGET_FILES=()
+    while IFS= read -r line; do
+        TARGET_FILES+=("$line")
+    done < "$list_file"
+    rm "$list_file"
+
+    for filepath in "${TARGET_FILES[@]}"; do
         local abs_path="${filepath/#\~/$HOME}"
         local flat_name
         flat_name=$(echo "$filepath" | sed 's/^~\///' | sed 's/\//__/g')
@@ -430,20 +461,22 @@ cmd_pull() {
         content=$(jq -r --arg fn "$flat_name" '.files[$fn].content // empty' "$response_body")
         
         if [[ -n "$content" ]]; then
-            debug "Restoring: $flat_name -> $abs_path"
-            mkdir -p "$(dirname "$abs_path")"
-            echo "$content" > "$abs_path"
-            success "Restored: $filepath"
+            if confirm "Overwrite $filepath?"; then
+                debug "Restoring: $flat_name -> $abs_path"
+                mkdir -p "$(dirname "$abs_path")"
+                echo "$content" > "$abs_path"
+                success "Restored: $filepath"
+            else
+                [[ "$VERBOSE_MODE" == "true" ]] && echo "Skipped: $filepath"
+            fi
         else
             warn "Not found in Gist: $flat_name"
         fi
-    done < "$list_file"
-    rm "$list_file"
+    done
     rm -f "$response_body"
 }
 
 # --- Flexible Argument Parser ---
-# Collects commands and flags regardless of order
 ARGS=()
 for arg in "$@"; do
     case $arg in
@@ -460,8 +493,8 @@ if [[ ${#ARGS[@]} -eq 0 ]]; then
 fi
 
 COMMAND="${ARGS[0]}"
-shift # Shift isn't strictly needed for array access but good habit if using $1 later (unused here)
-ARG_1="${ARGS[1]}" # For sub-commands like 'config token'
+shift
+ARG_1="${ARGS[1]}"
 
 case "$COMMAND" in
     setup) cmd_setup ;;
