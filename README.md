@@ -37,11 +37,11 @@ Most dotfile managers are over-engineered. They force you to move your files, cr
 
 You do not need to clone this repository. Install the binary directly to your path using `curl`.
 
-'''bash
+```bash
 mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/snvishna/dotfilesync/master/src/dfsync.sh -o ~/.local/bin/dfsync
 chmod +x ~/.local/bin/dfsync
-'''
+```
 
 > **Note:** Ensure `~/.local/bin` is in your `$PATH`.
 
@@ -49,13 +49,13 @@ chmod +x ~/.local/bin/dfsync
 * **curl** (Standard on most systems)
 * **jq** (Required for JSON parsing)
 
-'''bash
+```bash
 # macOS
 brew install jq
 
 # Linux (Ubuntu/Debian)
 sudo apt-get install jq
-'''
+```
 
 ---
 
@@ -69,9 +69,9 @@ First, link your machine to GitHub securely. You will need a **GitHub Personal A
 * [Generate Token Here](https://github.com/settings/tokens/new?scopes=gist&description=dotfilesync)
 
 Run the setup wizard:
-'''bash
+```bash
 dfsync setup
-'''
+```
 *Tip: Use `dfsync setup -y` to automatically accept default config paths.*
 
 ![](https://github.com/snvishna/dotfilesync/blob/master/resources/generate_personal_access_token.gif)
@@ -79,27 +79,27 @@ dfsync setup
 ### 2. Track Files
 Tell dfsync which files you want to manage. You can track individual files from anywhere in your home directory.
 
-'''bash
+```bash
 # Track your Zsh config
 dfsync track ~/.zshrc
 
 # Track your Starship prompt config
 dfsync track ~/.config/starship.toml
-'''
+```
 
 ### 3. Sync (Push)
 Upload your tracked files to the cloud. If you don't have a Gist yet, this command creates one for you automatically.
 
-'''bash
+```bash
 dfsync push
-'''
+```
 
 ### 4. Restore (Pull)
 On a new machine (or if you accidentally delete a config), download the latest version from your Gist.
 
-'''bash
+```bash
 dfsync pull
-'''
+```
 *⚠️ Warning: This overwrites your local files with the version from the Gist.*
 
 ---
@@ -110,7 +110,7 @@ dfsync uses a single JSON file to track your state.
 **Default Location:** `~/.config/dfsync.json`
 
 ### The Config Structure
-'''json
+```json
 {
   "gist_id": "8f3... (Auto-generated)",
   "files": [
@@ -119,7 +119,7 @@ dfsync uses a single JSON file to track your state.
     "~/.vimrc"
   ]
 }
-'''
+```
 You can edit this file manually if you prefer, or use the CLI commands (`track`/`untrack`) to manage it.
 
 > **Legacy Support:** If you are upgrading from an older version, your existing config (`dotFilePaths` / `gistId`) works automatically.
