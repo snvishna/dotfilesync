@@ -453,4 +453,3 @@ case "$COMMAND" in
     pull) cmd_pull ;;
     help|*) cmd_help ;;
 esac
-EOF
